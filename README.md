@@ -97,13 +97,31 @@ only gate — and query-param keys are not designed to be secrets.
   the upstream status code. No upstream response headers carrying cookies
   are forwarded; the response body is passed through as-is.
 
+## Images
+
+Multi-arch images (linux/arm64 + linux/amd64) are published to GitHub
+Container Registry on every push to `main` and on every `v*` tag:
+
+```
+ghcr.io/zuzak/vestibule:main             # moving tag for latest main
+ghcr.io/zuzak/vestibule:sha-<short>      # immutable per-commit tag
+ghcr.io/zuzak/vestibule:<semver>         # on v-tags only
+ghcr.io/zuzak/vestibule:latest           # on v-tags only
+```
+
+A GHCR package inherits the source repository's visibility when first
+published. If the repo is private, the package is private; pulling from
+Kubernetes then requires an image pull secret. Make the package public
+(GitHub → vestibule → Packages → `vestibule` → Package settings →
+Change visibility) once the code is cleared for public access.
+
 ## Deploying
 
 Out of scope for this repo. A typical deployment shape:
 
-1. Build the image from this repo (multi-arch, linux/arm64 + linux/amd64).
-2. Mount the YAML config from a Kubernetes `Secret`, so secrets stay in the
-   cluster's secret store and never enter this repo.
+1. Pull the image from `ghcr.io/zuzak/vestibule:<tag>`.
+2. Mount the YAML config from a Kubernetes `Secret`, so credentials stay
+   in the cluster's secret store and never enter this repo.
 3. Point an ingress-nginx `Ingress` at the service with:
    - an IP allowlist annotation restricting source ranges,
    - optionally an additional basic-auth layer.
