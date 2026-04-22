@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/itchyny/gojq"
 	"gopkg.in/yaml.v3"
 )
 
@@ -29,10 +30,41 @@ type AuthConfig struct {
 	Headers     map[string]string `yaml:"headers,omitempty"`
 }
 
+// EndpointType values.
+const (
+	EndpointTypeREST    = "rest"
+	EndpointTypeGraphQL = "graphql"
+)
+
+// ParamType values.
+const (
+	ParamTypeString  = "string"
+	ParamTypeInteger = "integer"
+	ParamTypeDate    = "date"
+)
+
 type Endpoint struct {
-	URL           string        `yaml:"url"`
-	AllowedParams []string      `yaml:"allowed_params"`
-	MinInterval   time.Duration `yaml:"min_interval"`
+	Type        string           `yaml:"type"`
+	URL         string           `yaml:"url"`
+	Description string           `yaml:"description"`
+	Params      map[string]Param `yaml:"params"`
+	Filter      string           `yaml:"filter"`
+	MinInterval time.Duration    `yaml:"min_interval"`
+
+	// GraphQL placeholders — schema-stable but unread this PR.
+	Query     string            `yaml:"query,omitempty"`
+	Variables map[string]string `yaml:"variables,omitempty"`
+
+	// compiledFilter is populated by LoadConfig when Filter is non-empty.
+	// Not serialised.
+	compiledFilter *gojq.Code `yaml:"-"`
+}
+
+type Param struct {
+	Type        string `yaml:"type"`
+	Description string `yaml:"description"`
+	Default     string `yaml:"default"`
+	Required    bool   `yaml:"required"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -51,6 +83,10 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	if err := cfg.compileFilters(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
@@ -109,7 +145,71 @@ func (c *Config) validate() error {
 			if ep.MinInterval < 0 {
 				return fmt.Errorf("upstream %q endpoint %q: min_interval must not be negative", name, epName)
 			}
+			switch ep.Type {
+			case "", EndpointTypeREST, EndpointTypeGraphQL:
+				// valid
+			default:
+				return fmt.Errorf("upstream %q endpoint %q: unsupported type %q (supported: rest, graphql)", name, epName, ep.Type)
+			}
+			for pName, p := range ep.Params {
+				if pName == "" {
+					return fmt.Errorf("upstream %q endpoint %q: param name must not be empty", name, epName)
+				}
+				if pName == "apikey" {
+					return fmt.Errorf("upstream %q endpoint %q: param name %q is reserved", name, epName, pName)
+				}
+				switch p.Type {
+				case "", ParamTypeString, ParamTypeInteger, ParamTypeDate:
+					// valid
+				default:
+					return fmt.Errorf("upstream %q endpoint %q param %q: unsupported type %q (supported: string, integer, date)", name, epName, pName, p.Type)
+				}
+				if p.Required && p.Default != "" {
+					return fmt.Errorf("upstream %q endpoint %q param %q: required and default are mutually exclusive", name, epName, pName)
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// compileFilters parses and compiles every endpoint's jq filter. Invalid
+// expressions cause config-load to fail rather than surfacing per-request.
+func (c *Config) compileFilters() error {
+	for upName, up := range c.Upstreams {
+		for epName, ep := range up.Endpoints {
+			if ep.Filter == "" {
+				continue
+			}
+			parsed, err := gojq.Parse(ep.Filter)
+			if err != nil {
+				return fmt.Errorf("upstream %q endpoint %q: parse filter: %w", upName, epName, err)
+			}
+			compiled, err := gojq.Compile(parsed)
+			if err != nil {
+				return fmt.Errorf("upstream %q endpoint %q: compile filter: %w", upName, epName, err)
+			}
+			ep.compiledFilter = compiled
+			up.Endpoints[epName] = ep
+		}
+		c.Upstreams[upName] = up
+	}
+	return nil
+}
+
+// endpointType returns the effective type for an endpoint, defaulting to rest
+// when empty.
+func (e Endpoint) endpointType() string {
+	if e.Type == "" {
+		return EndpointTypeREST
+	}
+	return e.Type
+}
+
+// paramType returns the effective type for a param, defaulting to string.
+func (p Param) paramType() string {
+	if p.Type == "" {
+		return ParamTypeString
+	}
+	return p.Type
 }

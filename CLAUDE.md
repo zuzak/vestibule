@@ -88,9 +88,35 @@ is sufficient.
 ## Testing posture
 
 - The acceptance criteria in the initial build included specific tests:
-  config loading with env interpolation, param allowlist, `min_interval`
-  floor, `form_login` cookie reuse, ALB 403 retry. These tests must
-  continue to pass; if a refactor changes behaviour that one of them
-  covers, update the test deliberately — do not weaken the assertion.
+  config loading with env interpolation, typed param validation,
+  `min_interval` floor, `form_login` cookie reuse, ALB 403 retry. These
+  tests must continue to pass; if a refactor changes behaviour that one
+  of them covers, update the test deliberately — do not weaken the
+  assertion.
 - Tests must not depend on real network endpoints. Use `httptest.Server`
   for every upstream interaction under test.
+
+## Schema evolution invariants
+
+- **Date aliases resolve in UTC.** Accepted forms are `YYYY-MM-DD`,
+  `today`, `yesterday`, `tomorrow`, and `today±N` (non-negative integer
+  N ≤ 3650). A configurable timezone may be added later, but until then
+  no alternate resolution behaviour is acceptable. Cache keys use the
+  resolved canonical date, so `date=today` and the equivalent literal
+  share an entry.
+- **Filters are config-time, not request-time.** The jq expression is
+  part of the endpoint definition, compiled at config load, and applied
+  to the upstream response before caching. Per-request filters would
+  require keying the cache on the filter expression and are out of
+  scope.
+- **The `/_manifest` endpoint is un-auth-gated.** Every field on
+  `Endpoint` must be explicitly evaluated for manifest inclusion;
+  default is exclude. The manifest is populated from a dedicated DTO
+  (`manifestEndpoint` and friends in `proxy.go`), not by marshalling
+  `Endpoint` directly — this way a new `Endpoint` field is invisible
+  in the manifest until someone deliberately opts it in. Never expose
+  `url`, `auth`, `filter`, `min_interval`, or anything else that could
+  reveal a credential or an upstream URL.
+- **GraphQL endpoint type is reserved.** `type: graphql` validates at
+  config load but requests to such an endpoint return 501 Not
+  Implemented. Implementation is a separate, tracked piece of work.
