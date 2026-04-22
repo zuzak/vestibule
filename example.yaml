@@ -1,0 +1,52 @@
+# Example vestibule config.
+#
+# Environment variables are interpolated with ${VAR}. Unset variables resolve
+# to an empty string; vestibule fails config validation rather than silently
+# making an unauthenticated request if a required credential interpolates to
+# empty only when that produces an otherwise-invalid config.
+#
+# Pass the path via VESTIBULE_CONFIG:
+#     VESTIBULE_CONFIG=./example.yaml ./vestibule
+
+listen: ":8080"
+metrics_listen: ":9090"
+
+# Optional. If set, inbound requests must carry ?apikey=<value>. If empty or
+# omitted, inbound auth is skipped — useful for local dev and for deployments
+# relying entirely on ingress-layer auth (IP allowlist + basic auth). The
+# query-param key is NOT a primary security layer; see README.
+api_key: ${PROXY_API_KEY}
+
+upstreams:
+  # A form-login upstream: POST credentials, reuse the resulting session
+  # cookie for subsequent API calls.
+  example_form:
+    auth:
+      type: form_login
+      login_url: https://example.com/login
+      login_method: POST
+      form_fields:
+        Email: ${EXAMPLE_FORM_EMAIL}
+        Password: ${EXAMPLE_FORM_PASSWORD}
+    endpoints:
+      diary:
+        url: https://example.com/api/diary/entries
+        allowed_params: [date]
+        min_interval: 30s
+      settings:
+        url: https://example.com/api/settings
+        allowed_params: []
+        min_interval: 5m
+
+  # A header-auth upstream: attach static headers to every outbound request.
+  example_bearer:
+    auth:
+      type: header
+      headers:
+        Authorization: "Bearer ${EXAMPLE_BEARER_TOKEN}"
+        X-Tenant: acme
+    endpoints:
+      widgets:
+        url: https://example.com/api/widgets
+        allowed_params: [status, limit]
+        min_interval: 10s
