@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 type Config struct {
 	Listen        string              `yaml:"listen"`
 	MetricsListen string              `yaml:"metrics_listen"`
-	APIKey        string              `yaml:"api_key"`
 	Upstreams     map[string]Upstream `yaml:"upstreams"`
 }
 
@@ -50,6 +50,7 @@ type Endpoint struct {
 	Params      map[string]Param `yaml:"params"`
 	Filter      string           `yaml:"filter"`
 	MinInterval time.Duration    `yaml:"min_interval"`
+	MCP         *MCPMeta         `yaml:"mcp,omitempty"`
 
 	// GraphQL placeholders — schema-stable but unread this PR.
 	Query     string            `yaml:"query,omitempty"`
@@ -59,6 +60,22 @@ type Endpoint struct {
 	// Not serialised.
 	compiledFilter *gojq.Code `yaml:"-"`
 }
+
+// MCPMeta is the optional block that makes an endpoint addressable through
+// the MCP server in ./mcp. Endpoints without an MCPMeta are reachable via
+// Vestibule but not exposed as MCP tools.
+//
+// This is the only non-secret Endpoint field that appears in /_manifest —
+// a conscious include under the "default is exclude" rule in CLAUDE.md.
+type MCPMeta struct {
+	ToolName string `yaml:"tool_name" json:"tool_name,omitempty"`
+}
+
+// mcpToolNameRE bounds tool names to a narrow shape: starts with a letter,
+// continues with letters, digits, or underscores. Anything else risks
+// breaking downstream MCP clients whose permission UIs expect
+// identifier-shaped names.
+var mcpToolNameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
 type Param struct {
 	Type        string `yaml:"type"`
@@ -166,6 +183,11 @@ func (c *Config) validate() error {
 				}
 				if p.Required && p.Default != "" {
 					return fmt.Errorf("upstream %q endpoint %q param %q: required and default are mutually exclusive", name, epName, pName)
+				}
+			}
+			if ep.MCP != nil && ep.MCP.ToolName != "" {
+				if !mcpToolNameRE.MatchString(ep.MCP.ToolName) {
+					return fmt.Errorf("upstream %q endpoint %q: mcp.tool_name %q must start with a letter and contain only letters, digits, and underscores", name, epName, ep.MCP.ToolName)
 				}
 			}
 		}

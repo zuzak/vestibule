@@ -72,8 +72,10 @@ func newProxy(cfg *Config, logger *slog.Logger, m *metrics, version string) (*pr
 	return p, nil
 }
 
-// buildMux returns the public HTTP handler tree. /healthz and /_manifest are
-// reachable without an apikey; see withAPIKey.
+// buildMux returns the public HTTP handler tree. There is no inbound
+// application-layer auth: Vestibule is an internal service behind a
+// ClusterIP, consumed by the MCP server in ./mcp. The network boundary is
+// the whole security story.
 func (p *proxy) buildMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -84,32 +86,10 @@ func (p *proxy) buildMux() http.Handler {
 	mux.HandleFunc("/_manifest", p.handleManifest)
 	mux.HandleFunc("/", p.handleRequest)
 
-	return p.withLogging(p.withAPIKey(mux))
-}
-
-// withAPIKey rejects requests missing or mismatching the configured key.
-// /healthz and /_manifest short-circuit the check — neither exposes upstream
-// state and the manifest is explicitly designed to be consumable without auth.
-func (p *proxy) withAPIKey(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/_manifest" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if p.cfg.APIKey == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if r.URL.Query().Get("apikey") != p.cfg.APIKey {
-			writeJSONError(w, http.StatusUnauthorized, "invalid or missing apikey")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return p.withLogging(mux)
 }
 
 // withLogging records the inbound request line, final status, and duration.
-// Never logs the query string — it may contain the apikey.
 func (p *proxy) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -213,12 +193,8 @@ func (p *proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 func (p *proxy) resolveParams(got url.Values, schema map[string]Param) (url.Values, error) {
 	out := url.Values{}
 
-	// 1. Reject unknown inbound params. apikey is consumed by the inbound
-	//    auth wrapper; never forwarded.
+	// 1. Reject unknown inbound params.
 	for k, vs := range got {
-		if k == "apikey" {
-			continue
-		}
 		if _, known := schema[k]; !known {
 			return nil, fmt.Errorf("param %q is not accepted by this endpoint", k)
 		}
@@ -470,6 +446,7 @@ type manifestEndpoint struct {
 	Type        string                   `json:"type"`
 	Description string                   `json:"description,omitempty"`
 	Params      map[string]manifestParam `json:"params,omitempty"`
+	MCP         *MCPMeta                 `json:"mcp,omitempty"`
 }
 
 type manifestParam struct {
@@ -507,6 +484,7 @@ func (p *proxy) handleManifest(w http.ResponseWriter, r *http.Request) {
 				Type:        ep.endpointType(),
 				Description: ep.Description,
 				Params:      params,
+				MCP:         ep.MCP,
 			}
 		}
 		resp.Upstreams[upName] = manifestUp{Endpoints: eps}

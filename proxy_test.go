@@ -60,7 +60,6 @@ func TestParamTypeValidation(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := &Config{
-		APIKey: "k",
 		Upstreams: map[string]Upstream{
 			"demo": {
 				Auth: AuthConfig{Type: "header", Headers: map[string]string{"X-T": "t"}},
@@ -83,28 +82,28 @@ func TestParamTypeValidation(t *testing.T) {
 	defer srv.Close()
 
 	// integer: valid
-	r, _ := http.Get(srv.URL + "/demo/things?apikey=k&limit=42")
+	r, _ := http.Get(srv.URL + "/demo/things?limit=42")
 	r.Body.Close()
 	if r.StatusCode != 200 || received.Get("limit") != "42" {
 		t.Errorf("valid integer: status=%d received limit=%q", r.StatusCode, received.Get("limit"))
 	}
 
 	// integer: garbage → 400
-	r2, _ := http.Get(srv.URL + "/demo/things?apikey=k&limit=abc")
+	r2, _ := http.Get(srv.URL + "/demo/things?limit=abc")
 	r2.Body.Close()
 	if r2.StatusCode != 400 {
 		t.Errorf("non-integer should 400, got %d", r2.StatusCode)
 	}
 
 	// date: garbage → 400
-	r3, _ := http.Get(srv.URL + "/demo/things?apikey=k&date=garbage")
+	r3, _ := http.Get(srv.URL + "/demo/things?date=garbage")
 	r3.Body.Close()
 	if r3.StatusCode != 400 {
 		t.Errorf("invalid date should 400, got %d", r3.StatusCode)
 	}
 
 	// string: anything accepted
-	r4, _ := http.Get(srv.URL + "/demo/things?apikey=k&tag=%22weird%40value%22")
+	r4, _ := http.Get(srv.URL + "/demo/things?tag=%22weird%40value%22")
 	r4.Body.Close()
 	if r4.StatusCode != 200 {
 		t.Errorf("string param should pass: got %d", r4.StatusCode)
@@ -295,7 +294,6 @@ func TestUnknownParamRejected(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := &Config{
-		APIKey: "k",
 		Upstreams: map[string]Upstream{
 			"demo": {
 				Auth: AuthConfig{Type: "header", Headers: map[string]string{"X-T": "t"}},
@@ -315,7 +313,7 @@ func TestUnknownParamRejected(t *testing.T) {
 	srv := httptest.NewServer(p.buildMux())
 	defer srv.Close()
 
-	r, _ := http.Get(srv.URL + "/demo/things?apikey=k&sneaky=1")
+	r, _ := http.Get(srv.URL + "/demo/things?sneaky=1")
 	r.Body.Close()
 	if r.StatusCode != 400 {
 		t.Errorf("unknown param should 400, got %d", r.StatusCode)
@@ -470,7 +468,6 @@ func TestGraphQLReturns501(t *testing.T) {
 // excludes url/auth/filter/min_interval.
 func TestManifestEndpoint(t *testing.T) {
 	cfg := &Config{
-		APIKey: "k",
 		Upstreams: map[string]Upstream{
 			"demo": {
 				Auth: AuthConfig{
@@ -490,6 +487,12 @@ func TestManifestEndpoint(t *testing.T) {
 						},
 						Filter:      "{a: .a}",
 						MinInterval: 30 * time.Second,
+						MCP:         &MCPMeta{ToolName: "get_things"},
+					},
+					// An endpoint without an MCP block should still appear
+					// in the manifest but with no mcp key.
+					"internal": {
+						URL: "https://example.com/api/internal",
 					},
 				},
 			},
@@ -573,42 +576,36 @@ func TestManifestEndpoint(t *testing.T) {
 	if date["required"] != false {
 		t.Errorf("param required: got %v", date["required"])
 	}
-}
 
-// TestManifestUnauthed: /_manifest must be reachable without the apikey.
-func TestManifestUnauthed(t *testing.T) {
-	cfg := &Config{
-		APIKey: "secret",
-		Upstreams: map[string]Upstream{
-			"demo": {
-				Auth: AuthConfig{Type: "header", Headers: map[string]string{"X-T": "t"}},
-				Endpoints: map[string]Endpoint{
-					"things": {URL: "https://example.com/api/things"},
-				},
-			},
-		},
+	// mcp block present on the endpoint with an MCPMeta.
+	mcp, ok := things["mcp"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("mcp block missing on endpoint with MCPMeta: %v", things)
 	}
-	p := newTestProxy(t, cfg)
-	srv := httptest.NewServer(p.buildMux())
-	defer srv.Close()
+	if mcp["tool_name"] != "get_things" {
+		t.Errorf("mcp.tool_name: got %v", mcp["tool_name"])
+	}
 
-	r, _ := http.Get(srv.URL + "/_manifest")
-	r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Errorf("/_manifest unauth: expected 200, got %d", r.StatusCode)
+	// mcp block absent on the endpoint without an MCPMeta.
+	internal, ok := eps["internal"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("internal endpoint missing")
+	}
+	if _, has := internal["mcp"]; has {
+		t.Errorf("mcp block should be omitted when MCPMeta is nil: %v", internal)
 	}
 }
 
-// TestInboundAPIKey covers: missing/wrong key → 401, correct key → 200,
-// /healthz always 200 regardless of key.
-func TestInboundAPIKey(t *testing.T) {
+// TestNoInboundAuth: with no auth configured at the application layer,
+// every route is reachable without credentials. Security is the network
+// boundary (ClusterIP, no ingress).
+func TestNoInboundAuth(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer upstream.Close()
 
 	cfg := &Config{
-		APIKey: "secret",
 		Upstreams: map[string]Upstream{
 			"demo": {
 				Auth: AuthConfig{Type: "header", Headers: map[string]string{"X-T": "t"}},
@@ -623,57 +620,16 @@ func TestInboundAPIKey(t *testing.T) {
 	srv := httptest.NewServer(p.buildMux())
 	defer srv.Close()
 
-	missing, _ := http.Get(srv.URL + "/demo/things?date=2026-04-22")
-	missing.Body.Close()
-	if missing.StatusCode != 401 {
-		t.Errorf("missing key: expected 401, got %d", missing.StatusCode)
-	}
-
-	wrong, _ := http.Get(srv.URL + "/demo/things?apikey=wrong&date=2026-04-22")
-	wrong.Body.Close()
-	if wrong.StatusCode != 401 {
-		t.Errorf("wrong key: expected 401, got %d", wrong.StatusCode)
-	}
-
-	right, _ := http.Get(srv.URL + "/demo/things?apikey=secret&date=2026-04-22")
-	right.Body.Close()
-	if right.StatusCode != 200 {
-		t.Errorf("correct key: expected 200, got %d", right.StatusCode)
-	}
-
-	health, _ := http.Get(srv.URL + "/healthz")
-	health.Body.Close()
-	if health.StatusCode != 200 {
-		t.Errorf("/healthz with no key: expected 200, got %d", health.StatusCode)
-	}
-}
-
-// TestInboundAPIKeyUnconfigured: if api_key is empty, no auth check runs.
-func TestInboundAPIKeyUnconfigured(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`ok`))
-	}))
-	defer upstream.Close()
-
-	cfg := &Config{
-		Upstreams: map[string]Upstream{
-			"demo": {
-				Auth: AuthConfig{Type: "header", Headers: map[string]string{"X-T": "t"}},
-				Endpoints: map[string]Endpoint{
-					"things": {URL: upstream.URL, Params: map[string]Param{"date": {Type: ParamTypeDate}}},
-				},
-			},
-		},
-	}
-	p := newTestProxy(t, cfg)
-	p.now = fixedClock("2026-04-22")
-	srv := httptest.NewServer(p.buildMux())
-	defer srv.Close()
-
-	resp, _ := http.Get(srv.URL + "/demo/things?date=2026-04-22")
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Errorf("expected 200 when api_key unset, got %d", resp.StatusCode)
+	for _, path := range []string{
+		"/demo/things?date=2026-04-22",
+		"/healthz",
+		"/_manifest",
+	} {
+		r, _ := http.Get(srv.URL + path)
+		r.Body.Close()
+		if r.StatusCode != 200 {
+			t.Errorf("%s: expected 200, got %d", path, r.StatusCode)
+		}
 	}
 }
 

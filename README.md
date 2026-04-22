@@ -1,10 +1,15 @@
 # vestibule
 
-A generic HTTP proxy for authenticated upstream APIs.
+A generic HTTP proxy for authenticated upstream APIs, plus a matching MCP
+server in [`./mcp`](./mcp) that exposes configured endpoints as tools.
 
-Trusted clients call vestibule over a public ingress; vestibule holds the
-upstream credentials and exposes a narrow, allowlisted view of the upstream
-API. The credentials never leave the pod.
+Vestibule is an **internal** service: it holds the upstream credentials
+and exposes a narrow, typed view of the upstream API to in-cluster
+consumers. The MCP server is the only intended consumer. Vestibule has
+no inbound auth at the application layer — its ClusterIP boundary is the
+whole security story on the inbound side.
+
+The credentials never leave the Vestibule pod.
 
 ## What it does
 
@@ -21,10 +26,10 @@ API. The credentials never leave the pod.
   that arrive faster than the floor are served from a small in-memory cache.
 - Retries once on the AWS ALB bare-403 stickiness race, and once on a
   `form_login` session expiry.
-- Exposes `GET /_manifest` (un-auth-gated) with per-endpoint metadata
-  suitable for generating tool schemas downstream. Excludes URLs, auth,
-  filters, and min_interval — manifest reveals nothing a caller shouldn't
-  know.
+- Exposes `GET /_manifest` with per-endpoint metadata suitable for
+  generating tool schemas downstream. Excludes URLs, auth, filters, and
+  min_interval — manifest reveals nothing a caller shouldn't know.
+  Consumed by the MCP server in `./mcp`.
 - Sends an honest `User-Agent`.
 - Exposes Prometheus metrics on a separate port.
 
@@ -32,10 +37,13 @@ API. The credentials never leave the pod.
 
 - **No writes.** Only `GET` is supported. `POST`/`PUT`/`DELETE` return 405.
 - **No response transformation.** Upstream JSON is passed through verbatim
-  with the upstream status code.
+  with the upstream status code. (The optional jq filter is a config-time
+  selection of fields, not per-request transformation.)
+- **No inbound auth.** Vestibule is internal-only — see "Security posture"
+  below.
 - **No per-client rate limiting.** Politeness is toward the *upstream*, via
-  `min_interval`. Per-client limits belong at the ingress.
-- **No multi-user auth.** The inbound `apikey` check is a single shared key.
+  `min_interval`. Per-client limits belong at the ingress in front of any
+  future consumer (e.g. the MCP), not here.
 
 ## Config
 
@@ -50,7 +58,6 @@ See [`example.yaml`](./example.yaml) for a full example.
 |---|---|---|
 | `listen` | string | Address for the public HTTP server. Default `:8080`. |
 | `metrics_listen` | string | Address for the Prometheus metrics server. Default `:9090`. |
-| `api_key` | string | Optional. If set, inbound requests must carry `?apikey=<value>`. If empty or absent, inbound auth is skipped. |
 | `upstreams.<name>.auth.type` | string | `form_login` or `header`. No other types are supported. |
 | `upstreams.<name>.auth.login_url` | string | `form_login` only. Full URL of the login endpoint. |
 | `upstreams.<name>.auth.login_method` | string | `form_login` only. HTTP method; defaults to `POST`. |
@@ -62,6 +69,7 @@ See [`example.yaml`](./example.yaml) for a full example.
 | `upstreams.<name>.endpoints.<name>.params.<name>` | map | Per-param schema: `type` (`string`/`integer`/`date`; defaults to `string`), `description`, `default`, `required`. `required` and `default` are mutually exclusive. |
 | `upstreams.<name>.endpoints.<name>.filter` | string | Optional jq expression applied to upstream responses before caching. Compiled at config load; invalid expressions fail startup. |
 | `upstreams.<name>.endpoints.<name>.min_interval` | duration | Minimum time between upstream hits for this endpoint + params combination. Go duration syntax, e.g. `30s`, `5m`. |
+| `upstreams.<name>.endpoints.<name>.mcp.tool_name` | string | Optional. If set, the MCP server in `./mcp` exposes this endpoint as a tool with the given name. Letters, digits, and underscores; starts with a letter. Omit to keep the endpoint reachable via Vestibule without exposing it as a tool. |
 
 ### Environment variable interpolation
 
@@ -74,32 +82,24 @@ cleanly if one is missing.
 
 ```
 GET /<upstream>/<endpoint>[?param=value&...]  -> proxy to the upstream
-GET /_manifest                                -> endpoint metadata (un-auth-gated)
+GET /_manifest                                -> endpoint metadata
 GET /healthz                                  -> 200 "ok" (always)
 ```
 
-The metrics server (default `:9090`) is a separate listener with no auth; it
-is intended for pod-network scraping only and should never be exposed on the
-public ingress.
+All routes are unauthenticated at the application layer. Both the main
+and metrics listeners are intended for pod-network traffic only and must
+not be exposed on a public ingress.
 
 ## Security posture
 
-**This is deliberately weak inbound auth.** The query-param `apikey` is
-visible in every log along its path (Anthropic's fetcher, ingress access
-logs, URL history). It is not the primary security layer.
+Vestibule is **internal-only**. The security boundary is the Kubernetes
+Service: `ClusterIP` with no `Ingress`. The MCP server in `./mcp` is the
+intended in-cluster consumer; the MCP is what gets an ingress, with its
+own auth in front of it.
 
-The primary security layer is expected to be ingress-level restriction. A
-typical deployment:
-
-1. Ingress-nginx in front, with an IP allowlist restricting inbound to the
-   specific client ranges (e.g. Anthropic's `web_fetch` egress ranges, plus
-   an operator VPN or Tailscale network).
-2. The `apikey` check exists to distinguish "a client on an allowlisted IP
-   with the correct key" from "a client on an allowlisted IP without it" —
-   specifically to reject other tenants sharing the allowlisted egress.
-
-**Skipping the allowlist is not an option.** Without it, the `apikey` is the
-only gate — and query-param keys are not designed to be secrets.
+If the Vestibule Service is reachable from outside the cluster, something
+is wrong at the network layer, not in this code. Don't paper over that by
+adding inbound auth — fix the boundary.
 
 ### Credential exposure
 
@@ -185,7 +185,6 @@ VESTIBULE_CONFIG=./example.yaml \
   EXAMPLE_FORM_EMAIL=a@b.com \
   EXAMPLE_FORM_PASSWORD=xxx \
   EXAMPLE_BEARER_TOKEN=xyz \
-  PROXY_API_KEY=dev \
   go run .
 ```
 

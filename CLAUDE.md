@@ -64,26 +64,28 @@ any of them.
 - **Response transformation or normalisation.** Upstream JSON passes
   through verbatim. If a caller wants a different shape, they transform
   on their end.
-- **Multi-user inbound auth.** A single `api_key` is the extent of inbound
-  auth this service provides. Do not add per-client keys, JWT verification,
-  OIDC, or anything else.
+- **Inbound auth.** None. Vestibule trusts its network boundary — see
+  "Inbound exposure" below. Do not add apikeys, JWT verification, OIDC,
+  or anything else to the application layer.
 - **Per-client rate limiting.** Politeness is toward the *upstream*; that
   is what `min_interval` is for. Per-client rate limiting belongs at the
-  ingress (e.g. ingress-nginx annotations).
+  ingress in front of any future consumer (e.g. the MCP), not here.
 - **Credential exposure.** Credentials must never appear in logs, metric
   labels, request paths, response bodies, or error messages returned to
   inbound clients. Review any new logging call against this.
 
-## Inbound auth posture
+## Inbound exposure
 
-The query-param `apikey` check is weak by design. It is visible in ingress
-access logs, the caller's URL history, and any intermediate fetcher (e.g.
-Anthropic's `web_fetch`). It is NOT the primary security layer.
+Vestibule is an internal service. It must not be exposed via public
+ingress. The MCP server in `mcp/` is the intended consumer; direct
+external use is not supported. There is no application-layer inbound
+auth — the network boundary (ClusterIP, no ingress) is the whole
+security story.
 
-The primary security layer is expected to be an ingress-layer IP allowlist
-restricting inbound to specific client ranges. Document this prominently in
-any deploy notes; do not write code or docs that imply the `apikey` alone
-is sufficient.
+Do not add inbound auth back, do not add per-client rate limiting, do not
+add anything that implies external consumers. If a future requirement
+pushes in that direction, the answer is a new layer in front (the MCP,
+or another component) — not making Vestibule public.
 
 ## Testing posture
 
