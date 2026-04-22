@@ -36,7 +36,10 @@ upstreams:
     endpoints:
       things:
         url: https://example.com/api/things
-        allowed_params: [date]
+        params:
+          date:
+            type: date
+            default: today
         min_interval: 30s
 `)
 	cfg, err := LoadConfig(path)
@@ -58,6 +61,13 @@ upstreams:
 	}
 	if up.Endpoints["things"].MinInterval != 30*time.Second {
 		t.Errorf("min_interval parse: got %v", up.Endpoints["things"].MinInterval)
+	}
+	p, ok := up.Endpoints["things"].Params["date"]
+	if !ok {
+		t.Fatalf("date param missing")
+	}
+	if p.Type != ParamTypeDate || p.Default != "today" {
+		t.Errorf("param parse: type=%q default=%q", p.Type, p.Default)
 	}
 }
 
@@ -82,6 +92,10 @@ upstreams:
 	}
 	if cfg.MetricsListen != ":9090" {
 		t.Errorf("default metrics_listen: got %q", cfg.MetricsListen)
+	}
+	ep := cfg.Upstreams["demo"].Endpoints["things"]
+	if ep.endpointType() != EndpointTypeREST {
+		t.Errorf("endpoint type default: got %q", ep.endpointType())
 	}
 }
 
@@ -146,9 +160,41 @@ upstreams:
       headers: {X-Key: v}
     endpoints:
       things:
-        allowed_params: [date]
+        params:
+          date: {type: date}
 `,
 			want: "url is required",
+		},
+		{
+			name: "unsupported endpoint type",
+			body: `
+upstreams:
+  demo:
+    auth:
+      type: header
+      headers: {X-Key: v}
+    endpoints:
+      things:
+        url: https://example.com/api/things
+        type: soap
+`,
+			want: "unsupported type",
+		},
+		{
+			name: "unsupported param type",
+			body: `
+upstreams:
+  demo:
+    auth:
+      type: header
+      headers: {X-Key: v}
+    endpoints:
+      things:
+        url: https://example.com/api/things
+        params:
+          weird: {type: uuid}
+`,
+			want: "unsupported type",
 		},
 	}
 	for _, tc := range cases {
@@ -162,5 +208,79 @@ upstreams:
 				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// TestRequiredAndDefaultRejected: a param declared both required and with a
+// non-empty default must fail config load.
+func TestRequiredAndDefaultRejected(t *testing.T) {
+	path := writeTempConfig(t, `
+upstreams:
+  demo:
+    auth:
+      type: header
+      headers: {X-K: v}
+    endpoints:
+      things:
+        url: https://example.com/api/things
+        params:
+          date:
+            type: date
+            required: true
+            default: today
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error %q should mention mutually exclusive", err.Error())
+	}
+}
+
+// TestJQFilterCompilesAtLoad: an invalid jq filter in config must fail load
+// rather than surface at request time.
+func TestJQFilterCompilesAtLoad(t *testing.T) {
+	path := writeTempConfig(t, `
+upstreams:
+  demo:
+    auth:
+      type: header
+      headers: {X-K: v}
+    endpoints:
+      things:
+        url: https://example.com/api/things
+        filter: "{broken"
+`)
+	_, err := LoadConfig(path)
+	if err == nil {
+		t.Fatalf("expected parse error for invalid jq, got nil")
+	}
+	if !strings.Contains(err.Error(), "filter") {
+		t.Errorf("error %q should mention filter", err.Error())
+	}
+}
+
+// TestJQFilterCompilesGoodFilter: a valid jq filter compiles and produces a
+// ready-to-use compiledFilter on the endpoint.
+func TestJQFilterCompilesGoodFilter(t *testing.T) {
+	path := writeTempConfig(t, `
+upstreams:
+  demo:
+    auth:
+      type: header
+      headers: {X-K: v}
+    endpoints:
+      things:
+        url: https://example.com/api/things
+        filter: "{a: .a}"
+`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	ep := cfg.Upstreams["demo"].Endpoints["things"]
+	if ep.compiledFilter == nil {
+		t.Fatal("expected compiledFilter to be populated")
 	}
 }

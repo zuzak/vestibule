@@ -18,8 +18,7 @@ metrics_listen: ":9090"
 api_key: ${PROXY_API_KEY}
 
 upstreams:
-  # A form-login upstream: POST credentials, reuse the resulting session
-  # cookie for subsequent API calls.
+  # A form-login upstream with a typed date param and a jq filter.
   example_form:
     auth:
       type: form_login
@@ -30,15 +29,34 @@ upstreams:
         Password: ${EXAMPLE_FORM_PASSWORD}
     endpoints:
       diary:
+        # type defaults to "rest". Valid values: rest, graphql.
+        # graphql is reserved and currently returns 501 Not Implemented.
+        type: rest
         url: https://example.com/api/diary/entries
-        allowed_params: [date]
+        description: |
+          Daily diary for a given day. Focus on short-term trends
+          (last 14-28 days).
+        params:
+          # Each param has a type (string, integer, date; defaults to string),
+          # a description, an optional default, and an optional required flag.
+          # required and default are mutually exclusive.
+          date:
+            type: date
+            description: "YYYY-MM-DD, or today/yesterday/tomorrow/today±N"
+            default: today
+        # Optional jq filter applied to upstream responses before caching.
+        # Compiled at config load; invalid expressions fail startup. Runtime
+        # errors degrade to "serve unfiltered".
+        filter: |
+          {date: .date, entries: .entries}
         min_interval: 30s
+
       settings:
         url: https://example.com/api/settings
-        allowed_params: []
+        description: Account-level settings; rarely changes.
         min_interval: 5m
 
-  # A header-auth upstream: attach static headers to every outbound request.
+  # A header-auth upstream with a typed integer param.
   example_bearer:
     auth:
       type: header
@@ -48,5 +66,13 @@ upstreams:
     endpoints:
       widgets:
         url: https://example.com/api/widgets
-        allowed_params: [status, limit]
+        description: Widget inventory.
+        params:
+          status:
+            type: string
+            description: "Filter by status (active, archived)."
+          limit:
+            type: integer
+            description: "Max results to return."
+            default: "50"
         min_interval: 10s

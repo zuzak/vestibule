@@ -33,6 +33,9 @@ type proxy struct {
 	throttle  *throttle
 	upstreams map[string]*upstreamRuntime
 	userAgent string
+	version   string
+	// now is injected for deterministic date alias resolution in tests.
+	now func() time.Time
 }
 
 // upstreamTimeout bounds every outbound HTTP call. An upstream with no
@@ -52,6 +55,8 @@ func newProxy(cfg *Config, logger *slog.Logger, m *metrics, version string) (*pr
 		throttle:  newThrottle(),
 		upstreams: make(map[string]*upstreamRuntime),
 		userAgent: fmt.Sprintf("vestibule/%s (+https://github.com/zuzak/vestibule)", version),
+		version:   version,
+		now:       time.Now,
 	}
 	for name, up := range cfg.Upstreams {
 		jar, err := cookiejar.New(nil)
@@ -67,8 +72,8 @@ func newProxy(cfg *Config, logger *slog.Logger, m *metrics, version string) (*pr
 	return p, nil
 }
 
-// buildMux returns the public HTTP handler tree. /healthz is registered
-// before the auth wrapper so healthchecks are never rejected.
+// buildMux returns the public HTTP handler tree. /healthz and /_manifest are
+// reachable without an apikey; see withAPIKey.
 func (p *proxy) buildMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -76,17 +81,18 @@ func (p *proxy) buildMux() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
 	})
+	mux.HandleFunc("/_manifest", p.handleManifest)
 	mux.HandleFunc("/", p.handleRequest)
 
 	return p.withLogging(p.withAPIKey(mux))
 }
 
 // withAPIKey rejects requests missing or mismatching the configured key.
-// /healthz is handled inside the wrapped mux but is never checked because we
-// short-circuit on the exact path first.
+// /healthz and /_manifest short-circuit the check — neither exposes upstream
+// state and the manifest is explicitly designed to be consumable without auth.
 func (p *proxy) withAPIKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/_manifest" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -161,7 +167,13 @@ func (p *proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params, err := filterParams(r.URL.Query(), ep.AllowedParams)
+	if ep.endpointType() == EndpointTypeGraphQL {
+		writeJSONError(w, http.StatusNotImplemented, "graphql endpoint type is not yet implemented")
+		p.metrics.inbound.WithLabelValues(upstreamName, endpointName, "501").Inc()
+		return
+	}
+
+	params, err := p.resolveParams(r.URL.Query(), ep.Params)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		p.metrics.inbound.WithLabelValues(upstreamName, endpointName, "400").Inc()
@@ -192,27 +204,69 @@ func (p *proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	p.metrics.inbound.WithLabelValues(upstreamName, endpointName, strconv.Itoa(result.status)).Inc()
 }
 
-func filterParams(got url.Values, allowed []string) (url.Values, error) {
-	allowedSet := make(map[string]struct{}, len(allowed))
-	for _, name := range allowed {
-		allowedSet[name] = struct{}{}
-	}
-	// apikey is consumed by the inbound auth wrapper; never forwarded.
+// resolveParams validates and resolves inbound query params against the
+// endpoint's typed Param schema. Unknown params are rejected. Missing
+// required params are rejected. Missing optional params with a default are
+// filled in. Date values (including defaults) are resolved to YYYY-MM-DD in
+// UTC. Integer values are validated but passed through as the original
+// string.
+func (p *proxy) resolveParams(got url.Values, schema map[string]Param) (url.Values, error) {
 	out := url.Values{}
-	for k, v := range got {
+
+	// 1. Reject unknown inbound params. apikey is consumed by the inbound
+	//    auth wrapper; never forwarded.
+	for k, vs := range got {
 		if k == "apikey" {
 			continue
 		}
-		if _, ok := allowedSet[k]; !ok {
-			return nil, fmt.Errorf("param %q is not in allowed_params", k)
+		if _, known := schema[k]; !known {
+			return nil, fmt.Errorf("param %q is not accepted by this endpoint", k)
 		}
-		out[k] = v
+		out[k] = vs
 	}
+
+	// 2. Apply defaults for omitted params, reject missing required params.
+	for name, spec := range schema {
+		if _, present := out[name]; present {
+			continue
+		}
+		if spec.Required {
+			return nil, fmt.Errorf("param %q is required", name)
+		}
+		if spec.Default != "" {
+			out.Set(name, spec.Default)
+		}
+	}
+
+	// 3. Validate and resolve per type.
+	for name, vs := range out {
+		spec := schema[name]
+		for i, v := range vs {
+			switch spec.paramType() {
+			case ParamTypeInteger:
+				if _, err := strconv.ParseInt(v, 10, 64); err != nil {
+					return nil, fmt.Errorf("param %q must be an integer, got %q", name, v)
+				}
+			case ParamTypeDate:
+				resolved, err := resolveDate(v, p.now)
+				if err != nil {
+					return nil, fmt.Errorf("param %q: %w", name, err)
+				}
+				vs[i] = resolved
+			case ParamTypeString:
+				// No validation.
+			}
+		}
+		out[name] = vs
+	}
+
 	return out, nil
 }
 
 // fetchUpstream performs the outbound request, applying auth, retry on 401/403
 // (form_login only), and the ALB-bare-403 retry that applies to any upstream.
+// The endpoint's compiled jq filter (if any) is applied to the final response
+// body before returning.
 func (p *proxy) fetchUpstream(ctx context.Context, up *upstreamRuntime, endpointName string, ep Endpoint, params url.Values) (*cachedResponse, error) {
 	// Attempt 1: ensure we have a session (form_login only), send the request.
 	if up.cfg.Auth.Type == "form_login" {
@@ -251,6 +305,21 @@ func (p *proxy) fetchUpstream(ctx context.Context, up *upstreamRuntime, endpoint
 		result, err = p.doUpstreamRequest(ctx, up, endpointName, ep, params)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Apply the jq filter to the final response body. Runtime errors degrade
+	// to "serve unfiltered" rather than 500 — the caller getting more data
+	// than expected is the safer failure mode.
+	if ep.compiledFilter != nil && result.status < 400 && len(result.body) > 0 {
+		filtered, err := applyFilter(ep.compiledFilter, result.body)
+		if err != nil {
+			p.logger.Warn("filter failed at runtime, serving unfiltered",
+				"upstream", up.name, "endpoint", endpointName, "error", err.Error())
+		} else {
+			result.body = filtered
+			// Content-Type stays as upstream sent it; the filtered body is
+			// still JSON, so this stays correct.
 		}
 	}
 
@@ -382,6 +451,68 @@ func (p *proxy) ensureLoggedIn(ctx context.Context, up *upstreamRuntime, force b
 
 	up.loggedIn = true
 	return nil
+}
+
+// manifestResponse is the DTO for GET /_manifest. It is constructed
+// explicitly rather than by tagging the Endpoint struct — new fields added
+// to Endpoint are excluded by default unless the author adds them here, per
+// the CLAUDE.md review rule.
+type manifestResponse struct {
+	Version   string                `json:"version"`
+	Upstreams map[string]manifestUp `json:"upstreams"`
+}
+
+type manifestUp struct {
+	Endpoints map[string]manifestEndpoint `json:"endpoints"`
+}
+
+type manifestEndpoint struct {
+	Type        string                   `json:"type"`
+	Description string                   `json:"description,omitempty"`
+	Params      map[string]manifestParam `json:"params,omitempty"`
+}
+
+type manifestParam struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+	Default     string `json:"default,omitempty"`
+	Required    bool   `json:"required"`
+}
+
+func (p *proxy) handleManifest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "only GET is supported")
+		return
+	}
+	resp := manifestResponse{
+		Version:   p.version,
+		Upstreams: make(map[string]manifestUp, len(p.cfg.Upstreams)),
+	}
+	for upName, up := range p.cfg.Upstreams {
+		eps := make(map[string]manifestEndpoint, len(up.Endpoints))
+		for epName, ep := range up.Endpoints {
+			params := make(map[string]manifestParam, len(ep.Params))
+			for pName, spec := range ep.Params {
+				params[pName] = manifestParam{
+					Type:        spec.paramType(),
+					Description: spec.Description,
+					Default:     spec.Default,
+					Required:    spec.Required,
+				}
+			}
+			if len(params) == 0 {
+				params = nil
+			}
+			eps[epName] = manifestEndpoint{
+				Type:        ep.endpointType(),
+				Description: ep.Description,
+				Params:      params,
+			}
+		}
+		resp.Upstreams[upName] = manifestUp{Endpoints: eps}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func writeCached(w http.ResponseWriter, r *cachedResponse) {

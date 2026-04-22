@@ -11,12 +11,20 @@ API. The credentials never leave the pod.
 - Fronts one or more upstream HTTP APIs behind `GET /<upstream>/<endpoint>?<params>`.
 - Supports two upstream auth types: `form_login` (POST credentials, reuse
   session cookie) and `header` (static headers on every request).
-- Only passes through query params that appear in each endpoint's
-  `allowed_params` list. Everything else is rejected with `400`.
+- Typed query params per endpoint: `string`, `integer`, or `date`. Unknown
+  inbound params are rejected with `400`. Missing required params likewise.
+  Date params accept `YYYY-MM-DD` and the aliases `today`, `yesterday`,
+  `tomorrow`, and `today±N` (N ≤ 3650), resolved in UTC.
+- Optional jq filter per endpoint, applied to the upstream response before
+  caching (`github.com/itchyny/gojq`).
 - Enforces a per-endpoint `min_interval` floor on upstream hits: requests
   that arrive faster than the floor are served from a small in-memory cache.
 - Retries once on the AWS ALB bare-403 stickiness race, and once on a
   `form_login` session expiry.
+- Exposes `GET /_manifest` (un-auth-gated) with per-endpoint metadata
+  suitable for generating tool schemas downstream. Excludes URLs, auth,
+  filters, and min_interval — manifest reveals nothing a caller shouldn't
+  know.
 - Sends an honest `User-Agent`.
 - Exposes Prometheus metrics on a separate port.
 
@@ -48,8 +56,11 @@ See [`example.yaml`](./example.yaml) for a full example.
 | `upstreams.<name>.auth.login_method` | string | `form_login` only. HTTP method; defaults to `POST`. |
 | `upstreams.<name>.auth.form_fields` | map | `form_login` only. Form fields posted as `application/x-www-form-urlencoded`. Typically includes credentials. |
 | `upstreams.<name>.auth.headers` | map | `header` only. Headers added to every outbound request. |
-| `upstreams.<name>.endpoints.<name>.url` | string | Full upstream URL (no query string — use `allowed_params`). |
-| `upstreams.<name>.endpoints.<name>.allowed_params` | list of strings | Inbound params not on this list are rejected with 400. |
+| `upstreams.<name>.endpoints.<name>.type` | string | `rest` or `graphql`. Defaults to `rest`. `graphql` validates but returns 501 until implementation lands. |
+| `upstreams.<name>.endpoints.<name>.url` | string | Full upstream URL (no query string — use `params`). |
+| `upstreams.<name>.endpoints.<name>.description` | string | Human-readable description, surfaced via `/_manifest`. |
+| `upstreams.<name>.endpoints.<name>.params.<name>` | map | Per-param schema: `type` (`string`/`integer`/`date`; defaults to `string`), `description`, `default`, `required`. `required` and `default` are mutually exclusive. |
+| `upstreams.<name>.endpoints.<name>.filter` | string | Optional jq expression applied to upstream responses before caching. Compiled at config load; invalid expressions fail startup. |
 | `upstreams.<name>.endpoints.<name>.min_interval` | duration | Minimum time between upstream hits for this endpoint + params combination. Go duration syntax, e.g. `30s`, `5m`. |
 
 ### Environment variable interpolation
@@ -63,6 +74,7 @@ cleanly if one is missing.
 
 ```
 GET /<upstream>/<endpoint>[?param=value&...]  -> proxy to the upstream
+GET /_manifest                                -> endpoint metadata (un-auth-gated)
 GET /healthz                                  -> 200 "ok" (always)
 ```
 
@@ -134,8 +146,8 @@ Specifics live in `zuzak/kube`, not here.
 1. Decide which auth type fits: `form_login` for cookie-based web logins,
    `header` for bearer tokens / API keys.
 2. Add an entry under `upstreams:` in your config. List every endpoint you
-   intend to expose, with an explicit `allowed_params` and a conservative
-   `min_interval`.
+   intend to expose, with an explicit `params` map (typed per param) and a
+   conservative `min_interval`.
 3. Store credentials in environment variables (or the equivalent Kubernetes
    Secret keys), and reference them via `${VAR}` in the config.
 4. Restart the proxy.
