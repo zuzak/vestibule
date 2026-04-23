@@ -99,3 +99,33 @@ async def fetch_manifest(
             await asyncio.sleep(delay)
             delay = min(delay * 2, backoff_max)
     raise RuntimeError(f"failed to fetch manifest after {attempts} attempts: {last_err}")
+
+
+def fetch_manifest_sync(
+    vestibule_url: str,
+    *,
+    attempts: int = 10,
+    backoff_initial: float = 0.5,
+    backoff_max: float = 8.0,
+) -> dict:
+    """Synchronous counterpart to fetch_manifest, for use at process
+    startup before any event loop is running. Same retry semantics."""
+    import time
+
+    url = vestibule_url.rstrip("/") + "/_manifest"
+    delay = backoff_initial
+    last_err: Exception | None = None
+    with httpx.Client() as client:
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = client.get(url, timeout=10.0)
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.HTTPError, ValueError) as e:
+                last_err = e
+                log.warning("manifest fetch attempt %d failed: %s", attempt, e)
+                if attempt == attempts:
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, backoff_max)
+    raise RuntimeError(f"failed to fetch manifest after {attempts} attempts: {last_err}")
