@@ -7,15 +7,13 @@
 #
 # Pass the path via VESTIBULE_CONFIG:
 #     VESTIBULE_CONFIG=./example.yaml ./vestibule
+#
+# Vestibule is an internal service. It has no inbound auth at the
+# application layer — the network boundary (ClusterIP, no ingress) is the
+# security story. The MCP server in ./mcp is the intended consumer.
 
 listen: ":8080"
 metrics_listen: ":9090"
-
-# Optional. If set, inbound requests must carry ?apikey=<value>. If empty or
-# omitted, inbound auth is skipped — useful for local dev and for deployments
-# relying entirely on ingress-layer auth (IP allowlist + basic auth). The
-# query-param key is NOT a primary security layer; see README.
-api_key: ${PROXY_API_KEY}
 
 upstreams:
   # A form-login upstream with a typed date param and a jq filter.
@@ -50,11 +48,17 @@ upstreams:
         filter: |
           {date: .date, entries: .entries}
         min_interval: 30s
+        # Optional: expose this endpoint as an MCP tool. Omit the block to
+        # keep the endpoint reachable via Vestibule but not as a tool.
+        mcp:
+          tool_name: get_food_diary
 
       settings:
         url: https://example.com/api/settings
         description: Account-level settings; rarely changes.
         min_interval: 5m
+        # No mcp block — reachable at /example_form/settings but not
+        # exposed as a tool.
 
   # A header-auth upstream with a typed integer param.
   example_bearer:
@@ -76,3 +80,5 @@ upstreams:
             description: "Max results to return."
             default: "50"
         min_interval: 10s
+        mcp:
+          tool_name: list_widgets
