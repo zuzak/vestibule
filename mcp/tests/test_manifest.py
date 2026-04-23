@@ -6,7 +6,13 @@ import httpx
 import pytest
 import respx
 
-from vestibule_mcp.manifest import Endpoint, Param, fetch_manifest, parse_manifest
+from vestibule_mcp.manifest import (
+    Endpoint,
+    Param,
+    fetch_manifest,
+    fetch_manifest_sync,
+    parse_manifest,
+)
 
 SAMPLE = {
     "version": "test",
@@ -140,3 +146,35 @@ async def test_fetch_raises_after_max_attempts():
                     backoff_initial=0.01,
                     backoff_max=0.01,
                 )
+
+
+def test_fetch_sync_retries_then_succeeds():
+    url = "http://vestibule.example/_manifest"
+    with respx.mock:
+        respx.get(url).mock(
+            side_effect=[
+                httpx.ConnectError("boom"),
+                httpx.Response(503, text="not ready"),
+                httpx.Response(200, json=SAMPLE),
+            ]
+        )
+        payload = fetch_manifest_sync(
+            "http://vestibule.example",
+            attempts=5,
+            backoff_initial=0.01,
+            backoff_max=0.01,
+        )
+    assert payload == SAMPLE
+
+
+def test_fetch_sync_raises_after_max_attempts():
+    url = "http://vestibule.example/_manifest"
+    with respx.mock:
+        respx.get(url).mock(return_value=httpx.Response(500))
+        with pytest.raises(RuntimeError, match="failed to fetch manifest"):
+            fetch_manifest_sync(
+                "http://vestibule.example",
+                attempts=3,
+                backoff_initial=0.01,
+                backoff_max=0.01,
+            )

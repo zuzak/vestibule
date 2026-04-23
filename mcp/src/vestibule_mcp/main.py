@@ -5,15 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import PlainTextResponse
 
 from . import metrics
-from .manifest import fetch_manifest, parse_manifest
+from .manifest import fetch_manifest_sync, parse_manifest
 from .tools import register_tools
 
 log = logging.getLogger("vestibule_mcp")
@@ -41,33 +39,6 @@ def _port(env: str, default: int) -> int:
         return default
 
 
-def _make_lifespan(vestibule_url: str):
-    """Build the lifespan context manager FastMCP will call on startup.
-
-    The httpx client, manifest fetch, and tool registration all happen
-    inside the lifespan — which runs on the same event loop as the MCP
-    server. Creating the client anywhere else would bind it to a
-    different loop and every later tool call would fail with
-    "Event loop is closed".
-    """
-
-    @asynccontextmanager
-    async def lifespan(mcp: FastMCP) -> AsyncIterator[dict]:
-        async with httpx.AsyncClient() as client:
-            payload = await fetch_manifest(client, vestibule_url)
-            endpoints = parse_manifest(payload)
-            register_tools(mcp, endpoints, client, vestibule_url)
-            tool_names = [ep.tool_name for ep in endpoints]
-            log.info(
-                "registered %d tools: %s",
-                len(tool_names),
-                ", ".join(tool_names) or "(none)",
-            )
-            yield {}
-
-    return lifespan
-
-
 def _add_healthz(mcp: FastMCP) -> None:
     """Add /healthz at the root of FastMCP's Starlette app (alongside /mcp,
     not nested under it). Confirmed empirically on the installed SDK."""
@@ -87,21 +58,36 @@ def main() -> None:
     http_port = _port("MCP_HTTP_PORT", DEFAULT_HTTP_PORT)
     metrics_port = _port("MCP_METRICS_PORT", DEFAULT_METRICS_PORT)
 
+    # Fetch the manifest and register tools BEFORE starting the server.
+    # FastMCP's user-provided lifespan only runs inside lowlevel
+    # Server.run(), which is invoked per MCP session — not at process
+    # start — so registering inside the lifespan leaves the server with
+    # zero tools until a client opens a session. Doing it here means
+    # the very first tools/list poll sees the full set.
+    payload = fetch_manifest_sync(vestibule_url)
+    endpoints = parse_manifest(payload)
+
+    # httpx.AsyncClient is constructed sync; it binds to whichever event
+    # loop runs the first await on it. uvicorn provides a single loop
+    # for all requests, so all tool calls share this client.
+    client = httpx.AsyncClient()
+
     # json_response=True keeps responses as plain JSON rather than SSE
     # framing; simpler through ingress-nginx.
-    #
-    # We do NOT set stateless_http=True. In stateless mode FastMCP
-    # invokes the lifespan per-request — which would close the httpx
-    # client between requests and break every tool call. Stateful mode
-    # runs the lifespan once at process start; the kube Deployment
-    # pins replicas=1 so cross-request session state is safe.
     mcp = FastMCP(
         "vestibule-mcp",
         host="0.0.0.0",
         port=http_port,
         streamable_http_path=DEFAULT_MCP_PATH,
         json_response=True,
-        lifespan=_make_lifespan(vestibule_url),
+    )
+
+    register_tools(mcp, endpoints, client, vestibule_url)
+    tool_names = [ep.tool_name for ep in endpoints]
+    log.info(
+        "registered %d tools: %s",
+        len(tool_names),
+        ", ".join(tool_names) or "(none)",
     )
 
     _add_healthz(mcp)
